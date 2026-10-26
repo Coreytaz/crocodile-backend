@@ -1,6 +1,7 @@
 {
   "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["eslint", "node"],
+  "plugins": ["eslint", "node", "typescript"],
+  "ignorePatterns": ["build/**"],
   "categories": { "correctness": "error" },
   "env": { "node": true }
 }

@@ -1,22 +1,68 @@
 # Crocodile backend
 
-Express 5 and Socket.IO server. Requires Node.js 24.18.0 or newer and npm.
+Авторитетный сервер игры на TypeScript, Express 5 и Socket.IO 4. Node.js **24.18.0+**, npm. Комнаты, чат и рисование работают исключительно через транспорт `websocket`. Старые HTTP-заглушки GET/POST `/game` удалены.
 
-## Run
+## Запуск и проверки
 
-- npm ci: install the locked dependency tree.
-- npm run dev: start with nodemon reloads.
-- npm start: start with Node.js on port 9999.
-- npm run lint: Oxlint correctness checks; warnings fail.
-- npm audit: dependency security report.
+- `npm ci` — установить зафиксированные зависимости.
+- Скопировать `.env.example` в `.env`, если нужны другие настройки. `npm start` и `npm run dev` читают этот файл средствами Node.js.
+- `npm run dev` — nodemon: компиляция TypeScript и запуск сервера, с повторной сборкой при изменениях исходников или tsconfig.
+- `npm run typecheck` — строгая проверка типов без генерации файлов.
+- `npm run build` — проверка типов и компиляция в `build/`. При ошибках типов JavaScript не генерируется.
+- `npm start` — запуск скомпилированного `build/server.js`; предварительно выполните `npm run build`.
+- `npm test` — автоматически собирает сервер, затем запускает существующие JavaScript-тесты через `node:test` и реальные Socket.IO-клиенты на случайных свободных портах. Проверяется именно production-код из `build/`.
+- `npm run lint` — Oxlint; предупреждения считаются ошибками.
 
-nodemon and Oxlint are development dependencies. Production can use npm ci --omit=dev and npm start.
+Переменные: `PORT=9999`, `ALLOWED_ORIGIN=http://localhost:3000`. Несколько разрешённых origin перечисляются через запятую. Проверяется и WebSocket handshake: одного CORS для него недостаточно. Клиенты без заголовка Origin допускаются для интеграций и тестов. Production: `npm ci`, `npm run build`, при необходимости `npm prune --omit=dev`, затем `npm start`. Можно также доставлять готовый `build/` и устанавливать только production-зависимости. При HTTPS страницы сервер также должен быть доступен по HTTPS/WSS.
 
-## Existing API
+## TypeScript
 
-- GET /game: existing JSON serialization of the in-memory rooms Map (currently {}).
-- POST /game: accepts a JSON object with roomId and optional userName; creates a room if needed and returns an empty 200 response. Missing/unparsed JSON body returns 400 with an error object.
-- Socket.IO ROOM:JOIN: logs the received payload; no acknowledgement or broadcast is implemented.
-- HTTP and Socket.IO CORS retain the existing wildcard origin policy.
+Точка входа — `server.ts`; игровая логика и состояние — `src/game-server.ts`; словарь — `src/words.ts`. `src/protocol.ts` описывает публичные DTO, команды, ответы и Socket.IO-события и соответствует `lib/protocol.ts` клиента. Сервер собирается отдельно от клиентского репозитория, без импорта его файлов.
 
-The upgrade preserves the existing room data and event behavior. All direct dependencies are pinned to stable versions, and package-lock.json locks transitives. cors is declared explicitly.
+Включён `strict`. Внутреннее состояние комнат и игроков, кеш подтверждений, таймеры и данные сокета имеют явные типы. JSON из сети принимается как `unknown` и сужается проверками перед использованием: клиентские типы не заменяют серверную валидацию. TypeScript компилирует `import`/`export` в CommonJS для совместимости с текущим Node.js-проектом; dev-инструменты в production не нужны.
+
+## Протокол
+
+Каждая команда принимает объект с уникальным `commandId` (1–80 латинских букв, цифр, `_` или `-`) и callback подтверждения. Ответ: `{ ok: true, data }` либо `{ ok: false, error: { code, message } }`. Для команд без результата `data` равен `null`. Успешные команды дедуплицируются по паре «событие + commandId»: последние 512 на участника, включая переподключение. Вход/создание кешируются на соединении. Повтор после таймаута должен использовать прежний ID.
+
+Команды рисования, слов, назначения роли и отправки чата включают текущую `version`. Она меняется при выдаче новых вариантов или смене рисующего. Каждое изменение рисунка увеличивает `revision`. Секретные поля отсутствуют в общих снимках.
+
+| Команда                              | Поля помимо commandId                            | Результат / действие                                             |
+| ------------------------------------ | ------------------------------------------------ | ---------------------------------------------------------------- |
+| `ROOM:CREATE`                        | `name`                                           | `{roomId, playerId, token}`; создатель — владелец и рисующий     |
+| `ROOM:JOIN`                          | `roomId`, `name` или `token`                     | Та же сессия; токен восстанавливает личность в течение 30 секунд |
+| `ROOM:LEAVE`                         | —                                                | Немедленный выход с отзывом токена                               |
+| `ROOM:SYNC`                          | —                                                | Отправить актуальные снимки и приватное состояние слова          |
+| `ROOM:ASSIGN_DRAWER`                 | `version, playerId`                              | Только владелец; целевой игрок должен быть в сети                |
+| `WORD:SELECT`                        | `version, word`                                  | Только рисующий; слово из его текущих трёх вариантов             |
+| `WORD:NEXT`                          | `version`                                        | Только рисующий; раскрытие предыдущего слова и сброс холста      |
+| `CHAT:SEND`                          | `version, text`                                  | Сообщение или скрытая проверка правильного ответа                |
+| `DRAW:ADD`                           | `version, operation`                             | Добавить фигуру, заливку или начало штриха                       |
+| `DRAW:APPEND`                        | `version, operationId, offset, points, complete` | Добавить точки текущего незавершённого штриха                    |
+| `DRAW:UNDO / DRAW:REDO / DRAW:CLEAR` | `version`                                        | Изменить общую историю рисунка                                   |
+
+`operation`: `{id, tool, color, size, points, complete}`. `tool`: `brush | eraser | line | rectangle | ellipse | fill`. Цвет — `#RRGGBB`, толщина — 1–80, точки `{x,y}` в пределах 1200 × 800. Фигурам нужны две точки, заливке одна. Кисть и ластик могут передаваться частями; `offset` должен совпадать с текущим количеством точек. Завершение допускает пустой массив с `complete: true`. ID последних 2048 операций дополнительно защищают от повторного добавления под новым commandId.
+
+| Серверное событие | Данные                                                                     |
+| ----------------- | -------------------------------------------------------------------------- |
+| `ROOM:STATE`      | `{id, ownerId, drawerId, version, hasWord, lastResult, players, messages}` |
+| `WORD:PRIVATE`    | `{version, word, options}`; зрителям всегда `word: null, options: []`      |
+| `CHAT:MESSAGE`    | `{id, text, time, kind, playerId?, name?}`                                 |
+| `DRAW:STATE`      | `{version, revision, operations, redoCount}` — полный снимок               |
+| `DRAW:ADDED`      | `{version, revision, operation}`                                           |
+| `DRAW:APPENDED`   | `{version, revision, operationId, offset, points, complete}`               |
+| `ROOM:REPLACED`   | Сессия восстановлена на другом соединении; прежнее теряет доступ к комнате |
+
+`players`: `{id, name, connected, guessed}[]`. `lastResult` — `null` до первой победы, затем `{round, winnerId, winnerName, word}` с итогами последнего завершённого раунда. Номер текущего раунда равен `version`. Эти результаты доступны всем, включая новых участников и восстановленные сессии; текущее секретное слово в них не попадает. Сообщения имеют `kind: chat | system`; время — Unix milliseconds. Вход и восстановление отправляют `ROOM:STATE`, `DRAW:STATE`, `WORD:PRIVATE`; обычный чат приходит отдельным событием. Undo/redo/clear отправляют полный снимок рисунка. Клиент обнаруживает пропуск ревизии и использует `ROOM:SYNC`.
+
+## Правила и ограничения
+
+- В комнате максимум 20 участников; ник 1–24 символа, уникальный без учёта регистра и «е/ё». Сообщение — 1–500 символов. Управляющие и невидимые форматирующие символы запрещены.
+- Нет таймера и очков. До выбора слова сервер запрещает рисование. Первый правильный ответ завершает раунд: публикуются имя победителя и ответ, сохраняется `lastResult`, очищается холст, увеличивается `version`, текущему рисующему отправляются три новых варианта. Нормализация догадки: регистр, «е/ё», внешние и повторяющиеся пробелы. Сам рисующий выиграть не может. Конкурирующие ответы и штрихи старого раунда отклоняются как `STALE_VERSION`; повтор подтверждённой команды не создаёт вторую победу.
+- Доступ к рисованию проверяется на сервере; зритель не может изменить холст поддельной командой. Новый рисующий выбирает новое слово; предыдущий рисунок и отметки угадавших сбрасываются.
+- Последние 200 сообщений; до 500 операций и 100 000 точек в рисунке, до 10 000 точек в одном штрихе, до 256 в одном пакете. При заполнении сервер возвращает `DRAW_LIMIT`, сохраняя рисунок. Undo освобождает место для новой ветки; очистка освобождает историю.
+- На соединение: максимум 400 команд рисования и 50 остальных за 10 секунд. Максимальный входящий пакет — 64 KiB; максимум 1000 комнат.
+- Обрыв сохраняет участника на 30 секунд и завершает начатый штрих. После окончательного ухода владелец заменяется первым оставшимся подключённым игроком (если все временно отключены — первым оставшимся). Уход рисующего передаёт рисование владельцу и запускает выбор слова.
+- Пустая комната живёт ещё 10 минут. Данные находятся в памяти одного процесса; после перезапуска комнаты и сессии недействительны. Масштабирование на несколько процессов и база данных не реализованы.
+
+Основные коды ошибок: `ROOM_NOT_FOUND`, `SESSION_EXPIRED`, `NAME_TAKEN`, `ROOM_FULL`, `SERVER_FULL`, `NOT_JOINED`, `ALREADY_JOINED`, `FORBIDDEN`, `PLAYER_OFFLINE`, `STALE_VERSION`, `STALE_DRAW`, `INVALID_STROKE`, `INVALID_DRAW`, `DRAW_LIMIT`, `RATE_LIMIT`. Все сообщения ошибок предназначены для показа в русском интерфейсе.
