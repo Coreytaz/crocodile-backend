@@ -20,7 +20,10 @@ app.get('/game', (req, res) => {
     res.json(rooms);
 })
 app.post('/game', (req, res) => {
-    const { roomId, userName } = req.body;
+    if (!req.body || typeof req.body !== 'object') {
+        return res.status(400).json({ error: 'JSON body is required' });
+    }
+    const { roomId } = req.body;
     if (!rooms.has(roomId)) {
         rooms.set(roomId, new Map([
             ['users', new Map()],
